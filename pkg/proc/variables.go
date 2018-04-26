@@ -30,6 +30,8 @@ const (
 
 	hashTophashEmpty = 0 // used by map reading code, indicates an empty bucket
 	hashMinTopHash   = 4 // used by map reading code, indicates minimum value of tophash that isn't empty or evacuated
+
+	maxFramePrefetchSize = 1 * 1024 * 1024 // Maximum prefetch size for a stack frame
 )
 
 type FloatSpecial uint8
@@ -56,6 +58,10 @@ const (
 	VariableShadowed
 	// VariableConstant means this variable is a constant value
 	VariableConstant
+	// VariableArgument means this variable is a function argument
+	VariableArgument
+	// VariableReturnArgument means this variable is a function return value
+	VariableReturnArgument
 )
 
 // Variable represents a variable. It contains the address, name,
@@ -614,12 +620,38 @@ func (scope *EvalScope) SetVariable(name, value string) error {
 
 // LocalVariables returns all local variables from the current function scope.
 func (scope *EvalScope) LocalVariables(cfg LoadConfig) ([]*Variable, error) {
-	return scope.variablesByTag(dwarf.TagVariable, &cfg)
+	vars, err := scope.Locals()
+	if err != nil {
+		return nil, err
+	}
+	vars = filterVariables(vars, func(v *Variable) bool {
+		return (v.Flags & (VariableArgument | VariableReturnArgument)) == 0
+	})
+	loadValues(vars, cfg)
+	return vars, nil
 }
 
 // FunctionArguments returns the name, value, and type of all current function arguments.
 func (scope *EvalScope) FunctionArguments(cfg LoadConfig) ([]*Variable, error) {
-	return scope.variablesByTag(dwarf.TagFormalParameter, &cfg)
+	vars, err := scope.Locals()
+	if err != nil {
+		return nil, err
+	}
+	vars = filterVariables(vars, func(v *Variable) bool {
+		return (v.Flags & (VariableArgument | VariableReturnArgument)) != 0
+	})
+	loadValues(vars, cfg)
+	return vars, nil
+}
+
+func filterVariables(vars []*Variable, pred func(v *Variable) bool) []*Variable {
+	r := make([]*Variable, 0, len(vars))
+	for i := range vars {
+		if pred(vars[i]) {
+			r = append(r, vars[i])
+		}
+	}
+	return r
 }
 
 // PackageVariables returns the name, value, and type of all package variables in the application.
@@ -820,6 +852,12 @@ func (v *Variable) maybeDereference() *Variable {
 		return r
 	default:
 		return v
+	}
+}
+
+func loadValues(vars []*Variable, cfg LoadConfig) {
+	for i := range vars {
+		vars[i].loadValueInternal(0, cfg)
 	}
 }
 
@@ -1874,20 +1912,17 @@ func (v *variablesByDepth) Swap(i int, j int) {
 }
 
 // Fetches all variables of a specific type in the current function scope
-func (scope *EvalScope) variablesByTag(tag dwarf.Tag, cfg *LoadConfig) ([]*Variable, error) {
+func (scope *EvalScope) Locals() ([]*Variable, error) {
 	if scope.Fn == nil {
 		return nil, errors.New("unable to find function context")
 	}
 
 	var vars []*Variable
 	var depths []int
-	varReader := reader.Variables(scope.BinInfo.dwarf, scope.Fn.offset, scope.PC, scope.Line, tag == dwarf.TagVariable)
+	varReader := reader.Variables(scope.BinInfo.dwarf, scope.Fn.offset, scope.PC, scope.Line, true)
 	hasScopes := false
 	for varReader.Next() {
 		entry := varReader.Entry()
-		if entry.Tag != tag {
-			continue
-		}
 		val, err := scope.extractVarInfoFromEntry(entry)
 		if err != nil {
 			// skip variables that we can't parse yet
@@ -1895,6 +1930,17 @@ func (scope *EvalScope) variablesByTag(tag dwarf.Tag, cfg *LoadConfig) ([]*Varia
 		}
 		vars = append(vars, val)
 		depth := varReader.Depth()
+		if entry.Tag == dwarf.TagFormalParameter {
+			if depth <= 1 {
+				depth = 0
+			}
+			isret, _ := entry.Val(dwarf.AttrVarParam).(bool)
+			if isret {
+				val.Flags |= VariableReturnArgument
+			} else {
+				val.Flags |= VariableArgument
+			}
+		}
 		depths = append(depths, depth)
 		if depth > 1 {
 			hasScopes = true
@@ -1911,44 +1957,6 @@ func (scope *EvalScope) variablesByTag(tag dwarf.Tag, cfg *LoadConfig) ([]*Varia
 
 	if hasScopes {
 		sort.Stable(&variablesByDepth{vars, depths})
-	}
-
-	// Prefetch the whole chunk of memory relative to these variables.
-	// Variables that are not stored contiguously in memory (i.e. the ones that
-	// read from a compositeMemory) will be ignored.
-
-	minaddr := vars[0].Addr
-	var maxaddr uintptr
-	var size int64
-
-	for _, v := range vars {
-		if _, extloc := v.mem.(*compositeMemory); extloc {
-			continue
-		}
-
-		if v.Addr < minaddr {
-			minaddr = v.Addr
-		}
-
-		size += v.DwarfType.Size()
-
-		if end := v.Addr + uintptr(v.DwarfType.Size()); end > maxaddr {
-			maxaddr = end
-		}
-	}
-
-	// check that we aren't trying to cache too much memory: we shouldn't
-	// exceed the real size of the variables by more than the number of
-	// variables times the size of an architecture pointer (to allow for memory
-	// alignment).
-	if int64(maxaddr-minaddr)-size <= int64(len(vars))*int64(scope.PtrSize()) {
-		mem := cacheMemory(vars[0].mem, minaddr, int(maxaddr-minaddr))
-
-		for _, v := range vars {
-			if _, extloc := v.mem.(*compositeMemory); !extloc {
-				v.mem = mem
-			}
-		}
 	}
 
 	lvn := map[string]*Variable{} // lvn[n] is the last variable we saw named n
@@ -1968,9 +1976,6 @@ func (scope *EvalScope) variablesByTag(tag dwarf.Tag, cfg *LoadConfig) ([]*Varia
 				otherv.Flags |= VariableShadowed
 			}
 			lvn[v.Name] = v
-		}
-		if cfg != nil {
-			v.loadValue(*cfg)
 		}
 	}
 

@@ -1226,6 +1226,8 @@ func TestFrameEvaluation(t *testing.T) {
 		assertNoError(err, t, "setFunctionBreakpoint")
 		assertNoError(proc.Continue(p), t, "Continue()")
 
+		t.Logf("stopped on thread %d, goroutine: %#v", p.CurrentThread().ThreadID(), p.SelectedGoroutine())
+
 		// Testing evaluation on goroutines
 		gs, err := proc.GoroutinesInfo(p)
 		assertNoError(err, t, "GoroutinesInfo")
@@ -1237,6 +1239,8 @@ func TestFrameEvaluation(t *testing.T) {
 				t.Logf("could not stacktrace goroutine %d: %v\n", g.ID, err)
 				continue
 			}
+			t.Logf("Goroutine %d", g.ID)
+			logStacktrace(t, frames)
 			for i := range frames {
 				if frames[i].Call.Fn != nil && frames[i].Call.Fn.Name == "main.agoroutine" {
 					frame = i
@@ -3329,7 +3333,7 @@ func TestIssue1034(t *testing.T) {
 		assertNoError(proc.Continue(p), t, "Continue()")
 		frames, err := p.SelectedGoroutine().Stacktrace(10)
 		assertNoError(err, t, "Stacktrace")
-		scope := proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frames[2])
+		scope := proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frames[2:]...)
 		args, _ := scope.FunctionArguments(normalLoadConfig)
 		assertNoError(err, t, "FunctionArguments()")
 		if len(args) > 0 {
@@ -3659,5 +3663,37 @@ func TestInlineStepOut(t *testing.T) {
 		{contContinue, 18},
 		{contStep, 6},
 		{contStepout, 18},
+	})
+}
+
+func TestIssue951(t *testing.T) {
+	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 9, -1, 0, 0, ""}) {
+		t.Skip("scopes not implemented in <=go1.8")
+	}
+
+	withTestProcess("issue951", t, func(p proc.Process, fixture protest.Fixture) {
+		assertNoError(proc.Continue(p), t, "Continue()")
+		scope, err := proc.GoroutineScope(p.CurrentThread())
+		assertNoError(err, t, "GoroutineScope")
+		args, err := scope.FunctionArguments(normalLoadConfig)
+		assertNoError(err, t, "FunctionArguments")
+		t.Logf("%#v", args[0])
+		if args[0].Flags&proc.VariableShadowed == 0 {
+			t.Error("argument is not shadowed")
+		}
+		vars, err := scope.LocalVariables(normalLoadConfig)
+		assertNoError(err, t, "LocalVariables")
+		shadowed, notShadowed := 0, 0
+		for i := range vars {
+			t.Logf("var %d: %#v\n", i, vars[i])
+			if vars[i].Flags&proc.VariableShadowed != 0 {
+				shadowed++
+			} else {
+				notShadowed++
+			}
+		}
+		if shadowed != 1 || notShadowed != 1 {
+			t.Errorf("Wrong number of shadowed/non-shadowed local variables: %d %d", shadowed, notShadowed)
+		}
 	})
 }

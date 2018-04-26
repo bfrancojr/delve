@@ -2,7 +2,6 @@ package proc
 
 import (
 	"bytes"
-	"debug/dwarf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -564,22 +563,13 @@ func (scope *EvalScope) evalIdent(node *ast.Ident) (*Variable, error) {
 		return nilVariable, nil
 	}
 
-	vars, err := scope.variablesByTag(dwarf.TagVariable, nil)
+	vars, err := scope.Locals()
 	if err != nil {
 		return nil, err
 	}
 	for i := range vars {
 		if vars[i].Name == node.Name && vars[i].Flags&VariableShadowed == 0 {
 			return vars[i], nil
-		}
-	}
-	args, err := scope.variablesByTag(dwarf.TagFormalParameter, nil)
-	if err != nil {
-		return nil, err
-	}
-	for i := range args {
-		if args[i].Name == node.Name {
-			return args[i], nil
 		}
 	}
 
@@ -931,19 +921,28 @@ func (scope *EvalScope) evalBinary(node *ast.BinaryExpr) (*Variable, error) {
 	if err != nil {
 		return nil, err
 	}
+	xv.loadValue(loadFullValue)
+	if xv.Unreadable != nil {
+		return nil, xv.Unreadable
+	}
+
+	// short circuits logical operators
+	switch node.Op {
+	case token.LAND:
+		if !constant.BoolVal(xv.Value) {
+			return newConstant(xv.Value, xv.mem), nil
+		}
+	case token.LOR:
+		if constant.BoolVal(xv.Value) {
+			return newConstant(xv.Value, xv.mem), nil
+		}
+	}
 
 	yv, err := scope.evalAST(node.Y)
 	if err != nil {
 		return nil, err
 	}
-
-	xv.loadValue(loadFullValue)
 	yv.loadValue(loadFullValue)
-
-	if xv.Unreadable != nil {
-		return nil, xv.Unreadable
-	}
-
 	if yv.Unreadable != nil {
 		return nil, yv.Unreadable
 	}
@@ -1015,6 +1014,14 @@ func compareOp(op token.Token, xv *Variable, yv *Variable) (bool, error) {
 	case reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128:
 		return constantCompare(op, xv.Value, yv.Value)
 	case reflect.String:
+		if xv.Len != yv.Len {
+			switch op {
+			case token.EQL:
+				return false, nil
+			case token.NEQ:
+				return true, nil
+			}
+		}
 		if int64(len(constant.StringVal(xv.Value))) != xv.Len || int64(len(constant.StringVal(yv.Value))) != yv.Len {
 			return false, fmt.Errorf("string too long for comparison")
 		}

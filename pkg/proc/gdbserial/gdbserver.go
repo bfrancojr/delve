@@ -79,14 +79,13 @@ import (
 
 	"golang.org/x/arch/x86/x86asm"
 
+	"github.com/derekparker/delve/pkg/logflags"
 	"github.com/derekparker/delve/pkg/proc"
 )
 
 const (
-	logGdbWire               = false
-	logGdbWireFullStopPacket = false
-	showLldbServerOutput     = false
-	logGdbWireMaxLen         = 120
+	gdbWireFullStopPacket = false
+	gdbWireMaxLen         = 120
 
 	maxTransmitAttempts    = 3    // number of retransmission attempts on failed checksum
 	initialInputBufferSize = 2048 // size of the input buffer for gdbConn
@@ -133,6 +132,14 @@ type Thread struct {
 	CurrentBreakpoint proc.BreakpointState
 	p                 *Process
 	setbp             bool // thread was stopped because of a breakpoint
+}
+
+// ErrBackendUnavailable is returned when the stub program can not be found.
+type ErrBackendUnavailable struct {
+}
+
+func (err *ErrBackendUnavailable) Error() string {
+	return "backend unavailable"
 }
 
 // gdbRegisters represents the current value of the registers of a thread.
@@ -404,6 +411,9 @@ func LLDBLaunch(cmd []string, wd string) (*Process, error) {
 
 		proc = exec.Command(debugserverExecutable, args...)
 	} else {
+		if _, err := exec.LookPath("lldb-server"); err != nil {
+			return nil, &ErrBackendUnavailable{}
+		}
 		port = unusedPort()
 		args := make([]string, 0, len(cmd)+3)
 		args = append(args, "gdbserver")
@@ -413,7 +423,7 @@ func LLDBLaunch(cmd []string, wd string) (*Process, error) {
 		proc = exec.Command("lldb-server", args...)
 	}
 
-	if showLldbServerOutput || logGdbWire {
+	if logflags.LLDBServerOutput() || logflags.GdbWire() {
 		proc.Stdout = os.Stdout
 		proc.Stderr = os.Stderr
 	}
@@ -464,6 +474,9 @@ func LLDBAttach(pid int, path string) (*Process, error) {
 		}
 		proc = exec.Command(debugserverExecutable, "-R", fmt.Sprintf("127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port), "--attach="+strconv.Itoa(pid))
 	} else {
+		if _, err := exec.LookPath("lldb-server"); err != nil {
+			return nil, &ErrBackendUnavailable{}
+		}
 		port = unusedPort()
 		proc = exec.Command("lldb-server", "gdbserver", "--attach", strconv.Itoa(pid), port)
 	}
